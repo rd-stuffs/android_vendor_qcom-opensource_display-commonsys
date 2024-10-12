@@ -27,6 +27,12 @@
  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+/*
+ * Changes from Qualcomm Innovation Center, Inc. are provided under the following license:
+ * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause-Clear
+ */
+
 #include "qdMetaData.h"
 
 #include <QtiGrallocPriv.h>
@@ -236,6 +242,7 @@ unsigned long getMetaDataSizeWithReservedRegion(uint64_t reserved_size) {
   return static_cast<unsigned long>(ROUND_UP_PAGESIZE(sizeof(MetaData_t) + reserved_size));
 }
 
+#ifndef MULTI_VIEW_SUPPORT
 static int validateAndMap(private_handle_t* handle) {
     if (private_handle_t::validate(handle)) {
         ALOGE("%s: Private handle is invalid - handle:%p", __func__, handle);
@@ -293,6 +300,66 @@ int setMetaData(private_handle_t *handle, DispParamType paramType,
     return setMetaDataVa(reinterpret_cast<MetaData_t*>(handle->base_metadata),
                          paramType, param);
 }
+
+#else
+static int validateAndMap(private_handle_t* handle) {
+    if (private_handle_t::validate(handle)) {
+        ALOGE("%s: Private handle is invalid - handle:%p", __func__, handle);
+        return -1;
+    }
+    if (handle->fd_metadata() < 0) {
+      // Metadata cannot be used
+      return -1;
+    }
+
+    if (!handle->base_metadata()) {
+        auto size = getMetaDataSize();
+        void *base = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED,
+                handle->fd_metadata(), 0);
+        if (base == reinterpret_cast<void*>(MAP_FAILED)) {
+            ALOGE("%s: metadata mmap failed - handle:%p fd: %d err: %s",
+                __func__, handle, handle->fd_metadata(), strerror(errno));
+            return -1;
+        }
+        handle->base_metadata() = (uintptr_t) base;
+        auto metadata = reinterpret_cast<MetaData_t *>(handle->base_metadata());
+        if (metadata->reservedSize) {
+          auto reserved_size = metadata->reservedSize;
+          munmap(reinterpret_cast<void *>(handle->base_metadata()), getMetaDataSize());
+          handle->base_metadata() = 0;
+          size = getMetaDataSizeWithReservedRegion(reserved_size);
+          void *new_base =
+              mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, handle->fd_metadata(), 0);
+          if (new_base == reinterpret_cast<void *>(MAP_FAILED)) {
+            ALOGE("%s: metadata mmap failed - handle:%p fd: %d err: %s", __func__, handle,
+                  handle->fd_metadata(), strerror(errno));
+            return -1;
+          }
+          handle->base_metadata() = (uintptr_t)new_base;
+        }
+    }
+    return 0;
+}
+
+static void unmapAndReset(private_handle_t *handle) {
+    if (private_handle_t::validate(handle) == 0 && handle->base_metadata()) {
+      // If reservedSize is 0, the return value will be the same as getMetaDataSize
+      auto metadata = reinterpret_cast<MetaData_t *>(handle->base_metadata());
+      auto size = getMetaDataSizeWithReservedRegion(metadata->reservedSize);
+      munmap(reinterpret_cast<void *>(handle->base_metadata()), size);
+      handle->base_metadata() = 0;
+    }
+}
+
+int setMetaData(private_handle_t *handle, DispParamType paramType,
+                void *param) {
+    auto err = validateAndMap(handle);
+    if (err != 0)
+        return err;
+    return setMetaDataVa(reinterpret_cast<MetaData_t*>(handle->base_metadata()),
+                         paramType, param);
+}
+#endif  // MULTI_VIEW_SUPPORT
 
 int setMetaDataVa(MetaData_t *data, DispParamType paramType,
                   void *param) {
@@ -424,6 +491,7 @@ int setMetaDataVa(MetaData_t *data, DispParamType paramType,
     return 0;
 }
 
+#ifndef MULTI_VIEW_SUPPORT
 int clearMetaData(private_handle_t *handle, DispParamType paramType) {
     auto err = validateAndMap(handle);
     if (err != 0)
@@ -431,6 +499,15 @@ int clearMetaData(private_handle_t *handle, DispParamType paramType) {
     return clearMetaDataVa(reinterpret_cast<MetaData_t *>(handle->base_metadata),
             paramType);
 }
+#else
+int clearMetaData(private_handle_t *handle, DispParamType paramType) {
+    auto err = validateAndMap(handle);
+    if (err != 0)
+        return err;
+    return clearMetaDataVa(reinterpret_cast<MetaData_t *>(handle->base_metadata()),
+            paramType);
+}
+#endif  // MULTI_VIEW_SUPPORT
 
 int clearMetaDataVa(MetaData_t *data, DispParamType paramType) {
     if (data == nullptr)
@@ -453,6 +530,7 @@ int clearMetaDataVa(MetaData_t *data, DispParamType paramType) {
     return 0;
 }
 
+#ifndef MULTI_VIEW_SUPPORT
 int getMetaData(private_handle_t *handle, DispFetchParamType paramType,
                                                     void *param) {
     int ret = validateAndMap(handle);
@@ -461,6 +539,16 @@ int getMetaData(private_handle_t *handle, DispFetchParamType paramType,
     return getMetaDataVa(reinterpret_cast<MetaData_t *>(handle->base_metadata),
                          paramType, param);
 }
+#else
+int getMetaData(private_handle_t *handle, DispFetchParamType paramType,
+                                                    void *param) {
+    int ret = validateAndMap(handle);
+    if (ret != 0)
+        return ret;
+    return getMetaDataVa(reinterpret_cast<MetaData_t *>(handle->base_metadata()),
+                         paramType, param);
+}
+#endif  // MULTI_VIEW_SUPPORT
 
 int getMetaDataVa(MetaData_t *data, DispFetchParamType paramType,
                   void *param) {
@@ -571,6 +659,7 @@ int getMetaDataVa(MetaData_t *data, DispFetchParamType paramType,
     return ret;
 }
 
+#ifndef MULTI_VIEW_SUPPORT
 int copyMetaData(struct private_handle_t *src, struct private_handle_t *dst) {
     auto err = validateAndMap(src);
     if (err != 0)
@@ -613,6 +702,50 @@ int copyMetaDataHandleToVa(struct private_handle_t *src, MetaData_t *dst_data) {
     *dst_data = *src_data;
     return 0;
 }
+#else
+int copyMetaData(struct private_handle_t *src, struct private_handle_t *dst) {
+    auto err = validateAndMap(src);
+    if (err != 0)
+        return err;
+
+    err = validateAndMap(dst);
+    if (err != 0)
+        return err;
+
+    MetaData_t *src_data = reinterpret_cast <MetaData_t *>(src->base_metadata());
+    MetaData_t *dst_data = reinterpret_cast <MetaData_t *>(dst->base_metadata());
+    *dst_data = *src_data;
+    return 0;
+}
+
+int copyMetaDataVaToHandle(MetaData_t *src_data, struct private_handle_t *dst) {
+    int err = -EINVAL;
+    if (src_data == nullptr)
+        return err;
+
+    err = validateAndMap(dst);
+    if (err != 0)
+        return err;
+
+    MetaData_t *dst_data = reinterpret_cast <MetaData_t *>(dst->base_metadata());
+    *dst_data = *src_data;
+    return 0;
+}
+
+int copyMetaDataHandleToVa(struct private_handle_t *src, MetaData_t *dst_data) {
+    int err = -EINVAL;
+    if (dst_data == nullptr)
+        return err;
+
+    err = validateAndMap(src);
+    if (err != 0)
+        return err;
+
+    MetaData_t *src_data = reinterpret_cast <MetaData_t *>(src->base_metadata());
+    *dst_data = *src_data;
+    return 0;
+}
+#endif  // MULTI_VIEW_SUPPORT
 
 int copyMetaDataVaToVa(MetaData_t *src_data, MetaData_t *dst_data) {
     int err = -EINVAL;
